@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fstream>
 #include <iterator>
 #include <map>
 #include <numeric>
@@ -374,6 +375,8 @@ struct cmd_params {
     bool                             verbose;
     bool                             progress;
     bool                             no_warmup;
+    std::string                      prompt_tokens_file;
+    int                              seed;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -420,6 +423,8 @@ static const cmd_params cmd_params_defaults = {
     /* verbose              */ false,
     /* progress             */ false,
     /* no_warmup            */ false,
+    /* prompt_tokens_file   */ "",
+    /* seed                 */ -1,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -440,6 +445,9 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
+    printf("  --prompt-tokens-file <file>                 prompt and depth tokens: the first n ids of this file of whitespace\n");
+    printf("                                              separated token ids instead of random tokens (default: random)\n");
+    printf("  --seed <n>                                  seed of the random tokens (default: %d, fixed sequence)\n", cmd_params_defaults.seed);
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     if (llama_supports_rpc()) {
@@ -538,6 +546,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
+    params.prompt_tokens_file   = cmd_params_defaults.prompt_tokens_file;
+    params.seed                 = cmd_params_defaults.seed;
     params.offline              = cmd_params_defaults.offline;
 
     if (const char * env = getenv("HF_TOKEN")) {
@@ -1056,6 +1066,18 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.progress = true;
             } else if (arg == "--no-warmup") {
                 params.no_warmup = true;
+            } else if (arg == "--prompt-tokens-file") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.prompt_tokens_file = argv[i];
+            } else if (arg == "--seed") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.seed = std::stoi(argv[i]);
             } else if (arg == "-fitt" || arg == "--fit-target") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1508,10 +1530,13 @@ struct test {
     int                      n_prompt;
     int                      n_gen;
     int                      n_depth;
+    std::string              prompt_tokens_file;
+    int                      seed;
     std::string              test_time;
     std::vector<uint64_t>    samples_ns;
 
-    test(const cmd_params_instance & inst, const llama_model * lmodel, const llama_context * ctx) :
+    test(const cmd_params_instance & inst, const llama_model * lmodel, const llama_context * ctx,
+         const cmd_params & params) :
         cpu_info(get_cpu_info()),
         gpu_info(get_gpu_info()) {
 
@@ -1549,6 +1574,8 @@ struct test {
         n_prompt       = inst.n_prompt;
         n_gen          = inst.n_gen;
         n_depth        = inst.n_depth;
+        prompt_tokens_file = params.prompt_tokens_file;
+        seed           = params.seed;
         // RFC 3339 date-time format
         time_t t       = time(NULL);
         std::strftime(buf, sizeof(buf), "%FT%TZ", gmtime(&t));
@@ -1605,7 +1632,7 @@ struct test {
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",
             "embeddings",
             "no_op_offload",  "no_host",        "repack",        "fit_target",    "fit_min_ctx",
-            "n_prompt",       "n_gen",          "n_depth",
+            "n_prompt",       "n_gen",          "n_depth",      "prompt_tokens_file", "seed",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
         return fields;
@@ -1618,7 +1645,7 @@ struct test {
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
+            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" || field == "seed") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
@@ -1708,6 +1735,8 @@ struct test {
                                             std::to_string(n_prompt),
                                             std::to_string(n_gen),
                                             std::to_string(n_depth),
+                                            prompt_tokens_file,
+                                            std::to_string(seed),
                                             test_time,
                                             std::to_string(avg_ns()),
                                             std::to_string(stdev_ns()),
@@ -2165,12 +2194,26 @@ struct ctx_state {
     std::vector<uint8_t> buf; // the llama_context state buffer
 };
 
-static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_threads) {
+static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_threads,
+                        const std::vector<llama_token> & prompt_tokens) {
     llama_set_n_threads(ctx, n_threads, n_threads);
 
     const llama_model * model   = llama_get_model(ctx);
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
+
+    if (!prompt_tokens.empty()) {
+        if ((size_t) n_prompt > prompt_tokens.size()) {
+            fprintf(stderr, "%s: the prompt tokens file has %zu tokens, %d are needed\n", __func__, prompt_tokens.size(), n_prompt);
+            return false;
+        }
+        for (int i = 0; i < n_prompt; i++) {
+            if (prompt_tokens[i] < 0 || prompt_tokens[i] >= n_vocab) {
+                fprintf(stderr, "%s: invalid token id %d in the prompt tokens file (n_vocab = %d)\n", __func__, prompt_tokens[i], n_vocab);
+                return false;
+            }
+        }
+    }
 
     std::vector<llama_token> tokens(n_batch);
 
@@ -2178,9 +2221,13 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
 
     while (n_processed < n_prompt) {
         int n_tokens = std::min(n_prompt - n_processed, n_batch);
-        tokens[0]    = n_processed == 0 && llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
-        for (int i = 1; i < n_tokens; i++) {
-            tokens[i] = std::rand() % n_vocab;
+        if (!prompt_tokens.empty()) {
+            std::copy_n(prompt_tokens.begin() + n_processed, n_tokens, tokens.begin());
+        } else {
+            tokens[0] = n_processed == 0 && llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
+            for (int i = 1; i < n_tokens; i++) {
+                tokens[i] = std::rand() % n_vocab;
+            }
         }
         common_batch batch = common_batch_get_one(ctx, tokens.data(), n_tokens);
         int res = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
@@ -2271,6 +2318,22 @@ int llama_bench(int argc, char ** argv) {
     ggml_backend_load_all();
 
     cmd_params params = parse_cmd_params(argc, argv);
+
+    if (params.seed >= 0) {
+        std::srand(params.seed);
+    }
+    std::vector<llama_token> prompt_tokens;
+    if (!params.prompt_tokens_file.empty()) {
+        std::ifstream f(params.prompt_tokens_file);
+        llama_token   token;
+        while (f >> token) {
+            prompt_tokens.push_back(token);
+        }
+        if (!f.eof() || prompt_tokens.empty()) {
+            fprintf(stderr, "%s: error: cannot read token ids from %s\n", __func__, params.prompt_tokens_file.c_str());
+            return 1;
+        }
+    }
 
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu_dev) {
@@ -2381,7 +2444,7 @@ int llama_bench(int argc, char ** argv) {
             return 1;
         }
 
-        test t(inst, lmodel, ctx);
+        test t(inst, lmodel, ctx, params);
 
         llama_memory_clear(llama_get_memory(ctx), false);
 
@@ -2418,7 +2481,7 @@ int llama_bench(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup prompt run\n", params_idx, params_count);
                 }
                 //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
-                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
+                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads, prompt_tokens);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt warmup\n", __func__);
                     llama_free(ctx);
@@ -2460,7 +2523,7 @@ int llama_bench(int argc, char ** argv) {
                         fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d\n", params_idx, params_count,
                                 i + 1, params.reps);
                     }
-                    bool res = test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads);
+                    bool res = test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads, prompt_tokens);
                     if (!res) {
                         fprintf(stderr, "%s: error: failed to run depth\n", __func__);
                         llama_free(ctx);
@@ -2487,7 +2550,7 @@ int llama_bench(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
-                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
+                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads, prompt_tokens);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt\n", __func__);
                     llama_free(ctx);

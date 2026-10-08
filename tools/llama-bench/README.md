@@ -34,6 +34,9 @@ options:
   -v, --verbose                             verbose output
   --progress                                print test progress indicators
   --no-warmup                               skip warmup runs before benchmarking
+  --prompt-tokens-file <file>               prompt and depth tokens: the first n ids of this file of whitespace
+                                            separated token ids instead of random tokens (default: random)
+  --seed <n>                                seed of the random tokens (default: -1, fixed sequence)
   -fitt, --fit-target <MiB>                 fit model to device memory with this margin per device in MiB (default: off)
   -fitc, --fit-ctx <n>                      minimum ctx size for --fit-target (default: 4096)
   -rpc, --rpc <rpc_servers>                 register RPC devices (comma separated)
@@ -94,6 +97,13 @@ With the exception of `-r`, `-o` and `-v`, all options can be specified multiple
 Each test is repeated the number of times given by `-r`, and the results are averaged. The results are given in average tokens per second (t/s) and standard deviation. Some output formats (e.g. json) also include the individual results of each repetition.
 
 Using the `-d <n>` option, each test can be run at a specified context depth, prefilling the KV cache with `<n>` tokens.
+
+The prompt and depth tokens are random by default, the same sequence in every run. `--seed <n>` gives a different
+sequence. `--prompt-tokens-file <file>` uses real tokens instead: every prompt of `n` tokens and every depth prefill of
+`n` tokens is the first `n` ids of the file (whitespace separated, e.g. from `llama-tokenize --ids`; add the BOS token
+if the model needs it). This makes it possible to feed exactly the same tokens to another inference engine. The
+generated tokens of tg tests stay random. The file name and the seed are included in the csv, json, jsonl and sql
+output.
 
 For a description of the other options, see the [completion example](../completion/README.md).
 
